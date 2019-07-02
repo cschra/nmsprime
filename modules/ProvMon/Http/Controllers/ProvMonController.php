@@ -8,7 +8,6 @@ use Modules\ProvBase\Entities\Cmts;
 use Modules\ProvBase\Entities\Modem;
 use Modules\HfcReq\Entities\NetElement;
 use Modules\ProvBase\Entities\ProvBase;
-use App\Http\Controllers\BaseController;
 use Modules\ProvBase\Entities\Configfile;
 
 /**
@@ -34,7 +33,7 @@ class ProvMonController extends \BaseController
      * Creates tabs to analysis pages.
      *
      * @author Roy Schneider
-     * @param int
+     * @param int   modem id
      * @return array
      */
     public function analysisPages($id)
@@ -136,10 +135,12 @@ class ProvMonController extends \BaseController
 
         // Dashboard
         $dash['modemServicesStatus'] = self::modemServicesStatus($modem, $configfile['text']);
-        // time of this function should be observerd - can take a huge time as well
-        $modemConfigfileStatus = self::modemConfigfileStatus($modem, $log, $configfile['mtime']);
-        if ($modemConfigfileStatus) {
-            $dash['modemConfigfileStatus'] = $modemConfigfileStatus;
+        // time of this function should be observed - can take a huge time as well
+        if ($online) {
+            $modemConfigfileStatus = self::modemConfigfileStatus($modem);
+            if ($modemConfigfileStatus) {
+                $dash['modemConfigfileStatus'] = $modemConfigfileStatus;
+            }
         }
 
         $host_id = $this->monitoring_get_host_id($modem);
@@ -228,40 +229,36 @@ class ProvMonController extends \BaseController
     /**
      * Determine if modem runs with/has already downloaded actual configfile
      *
-     * @param object    Modem
-     * @param array     Lines of Log messages
-     * @return array    Color & status text
+     * @param object Modem
      */
-    public static function modemConfigfileStatus($modem, $log, $configDate)
+    public static function modemConfigfileStatus($modem)
     {
-        $lastDownload = preg_grep('/in.tftpd(.*?) cm\//', $log);
+        $path = '/var/log/nmsprime/tftpd-cm.log';
+        $ts_cf = filemtime("/tftpboot/cm/$modem->hostname.cfg");
+        $ts_dl = exec("zgrep $modem->hostname $path | tail -1 | cut -d' ' -f1");
 
-        if (! $lastDownload) {
-            $logfiles = glob('/var/log/messages*');
-            // $logfiles = glob('/var/log/messages-mablx10/messages*');
-            arsort($logfiles);
+        if (! $ts_dl) {
+            // get all but the current logfile, order them descending by file modification time
+            // we assume that logrotate adds "-TIMESTAMP" to the logfiles name
+            $logfiles = glob("$path-*");
+            usort($logfiles, function ($a, $b) {
+                return filemtime($b) - filemtime($a);
+            });
 
             foreach ($logfiles as $path) {
-                exec("grep -m 1 $modem->hostname $path | grep tftpd", $lastDownload);
+                // get the latest line indicating a configfile download
+                $ts_dl = exec("zgrep $modem->hostname $path | tail -1 | cut -d' ' -f1");
 
-                if ($lastDownload) {
+                if ($ts_dl) {
                     break;
                 }
             }
         }
 
-        if (! $lastDownload) {
-            // return ['bsclass' => 'info', 'text' => trans('messages.modemAnalysis.missingLD')];
-            return;
+        if (! $ts_dl) {
+            // inform the user that last download was to long ago to check if the configfile is up-to-date
+            return ['bsclass' => 'info', 'text' => trans('messages.modemAnalysis.missingLD')];
         }
-
-        $firstKey = key($lastDownload);
-
-        preg_match('/[A-Z][a-z]{2} {1,2}\d{1,2} \d\d:\d\d:\d\d/', $lastDownload[$firstKey], $lastDownload);
-        preg_match('/[A-Z][a-z]{2} {1,2}\d{1,2} \d\d:\d\d:\d\d/', $configDate, $configDate);
-
-        $ts_dl = strtotime($lastDownload[0]);
-        $ts_cf = strtotime($configDate[0]);
 
         if ($ts_dl <= $ts_cf) {
             return ['bsclass' => 'warning', 'text' => trans('messages.modemAnalysis.cfOutdated')];
@@ -706,6 +703,7 @@ class ProvMonController extends \BaseController
             $sys['SysDescr'] = [snmpget($host, $com, '.1.3.6.1.2.1.1.1.0')];
             $sys['Firmware'] = [snmpget($host, $com, '.1.3.6.1.2.1.69.1.3.5.0')];
             $sys['Uptime'] = [$this->_secondsToTime(snmpget($host, $com, '.1.3.6.1.2.1.1.3.0') / 100)];
+            $sys['Status Code'] = [snmpget($host, $com, '.1.3.6.1.2.1.10.127.1.2.2.1.2.2')];
             $sys['DOCSIS'] = [$this->_docsis_mode($docsis)]; // TODO: translate to DOCSIS version
             $sys['CMTS'] = [$cmts->hostname];
             $ds['Frequency MHz'] = ArrayHelper::ArrayDiv(snmpwalk($host, $com, '.1.3.6.1.2.1.10.127.1.1.1.1.2'), 1000000);
@@ -1228,11 +1226,12 @@ class ProvMonController extends \BaseController
      */
     public static function checkNetelementtype($model)
     {
-        $provmon = new self;
         if (! isset($model->netelementtype)) {
             return [];
         }
+
         $type = $model->netelementtype->get_base_type();
+        $provmon = new self;
 
         $tabs = [['name' => 'Edit', 'route' => 'NetElement.edit', 'link' => $model->id]];
 
@@ -1276,27 +1275,6 @@ class ProvMonController extends \BaseController
 
         return substr($return[0], 3);
     }
-
-    /**
-     * Add Logging tab in edit page.
-     * from BaseController
-     *
-     * @author Roy Schneider
-     * @param array, Modules\HfcReq\Entities\NetElement
-     * @return array
-     */
-    public function loggingTab($array, $model)
-    {
-        $baseController = new BaseController;
-        array_push($array, $baseController->get_form_tabs($model)[0]);
-
-        return $array;
-    }
-
-    /*
-     * Functions for Feature single Windows Stuff
-     * This stuff is at the time not in production
-     */
 
     /**
      * Monitoring
@@ -1357,15 +1335,15 @@ class ProvMonController extends \BaseController
         $roCommunity = $provbase->ro_community;
         $rwCommunity = $provbase->rw_community;
 
-        // enable docsIf3CmSpectrumAnalysisCtrlCmd
-        snmp2_set($hostname, $rwCommunity, '.1.3.6.1.4.1.4491.2.1.20.1.34.1.0', 'i', 1);
-
         // set frequency span from 150 to 862 MHz
         snmp2_set($hostname, $rwCommunity, '.1.3.6.1.4.1.4491.2.1.20.1.34.3.0', 'u', 154000000);
         snmp2_set($hostname, $rwCommunity, '.1.3.6.1.4.1.4491.2.1.20.1.34.4.0', 'u', 866000000);
 
         // every 8 MHz
         snmp2_set($hostname, $rwCommunity, '.1.3.6.1.4.1.4491.2.1.20.1.34.5.0', 'u', 8000000);
+
+        // enable docsIf3CmSpectrumAnalysisCtrlCmd after setting values
+        snmp2_set($hostname, $rwCommunity, '.1.3.6.1.4.1.4491.2.1.20.1.34.1.0', 'i', 1);
 
         // after enabling docsIf3CmSpectrumAnalysisCtrlCmd it may take a few seconds to start the snmpwalḱ (error: End of MIB)
         $time = 1;
@@ -1390,7 +1368,7 @@ class ProvMonController extends \BaseController
         // returned values: level in 10th dB and frequency in Hz
         // Example: SNMPv2-SMI::enterprises.4491.2.1.20.1.35.1.3.985500000 = INTEGER: -361
         foreach ($expressions as $oid => $level) {
-            preg_match('/[0-9]{9}/', $oid, $frequency);
+            preg_match('/[0-9]{7,}/', $oid, $frequency);
             $data['span'][] = $frequency[0] / 1000000;
             $data['amplitudes'][] = intval($level) / 10;
         }

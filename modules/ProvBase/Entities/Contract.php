@@ -2,7 +2,6 @@
 
 namespace Modules\ProvBase\Entities;
 
-use Modules\BillingBase\Entities\Invoice;
 use Modules\BillingBase\Entities\SettlementRun;
 
 class Contract extends \BaseModel
@@ -90,7 +89,7 @@ class Contract extends \BaseModel
     {
         $bsclass = 'success';
 
-        if (! $this->internet_access) {
+        if (! ($this->internet_access || $this->has_telephony)) {
             $bsclass = 'active';
 
             // '$this->id' to dont check when index table header is determined!
@@ -110,38 +109,59 @@ class Contract extends \BaseModel
     // View Relation.
     public function view_has_many()
     {
-        if (\Module::collections()->has('BillingBase')) {
-            // view has many version 1
-            $ret['Edit']['Modem'] = $this->modems;
-            $ret['Edit']['Item'] = $this->items;
-            $ret['Edit']['SepaMandate'] = $this->sepamandates;
-        }
-
-        $ret['Edit']['Modem'] = $this->modems;
+        $ret['Edit']['Modem']['class'] = 'Modem';
+        $ret['Edit']['Modem']['relation'] = $this->modems;
 
         if (\Module::collections()->has('BillingBase')) {
             // view has many version 2
+            $ret['Edit']['Item']['class'] = 'Item';
+            $ret['Edit']['Item']['relation'] = $this->items;
             $ret['Billing']['Item']['class'] = 'Item';
             $ret['Billing']['Item']['relation'] = $this->items;
+            $ret['Edit']['SepaMandate']['class'] = 'SepaMandate';
+            $ret['Edit']['SepaMandate']['relation'] = $this->sepamandates;
             $ret['Billing']['SepaMandate']['class'] = 'SepaMandate';
             $ret['Billing']['SepaMandate']['relation'] = $this->sepamandates;
 
-            // Show invoices in 2 panels - 2nd panel with old invoices collapsed and in 2 columns
-            $p1 = $this->invoices()->orderBy('id', 'desc')->take(15)->get();
+            if (\Module::collections()->has('Dunning')) {
+                // resulting outstanding amount
+                $ret['Edit']['DebtResult']['view']['view'] = 'dunning::Debt.result';
+                $ret['Edit']['DebtResult']['view']['vars']['debt'] = $this->getResultingDebt();
+            }
+
+            // Show invoices in 2 panels
+            if (! $this->relationLoaded('invoices')) {
+                $this->setRelation('invoices', $this->invoices()->orderBy('id', 'desc')->get());
+            }
+
+            $invoicesPanel1 = collect();
+            $countPanel1 = $this->invoices->count() > 15 ? 15 : $this->invoices->count();
+
+            for ($i = 0; $i < $countPanel1; $i++) {
+                $invoicesPanel1->push($this->invoices[$i]);
+            }
+
+            if (\Module::collections()->has('Dunning')) {
+                $ret['Billing']['Debt']['class'] = 'Debt';
+                $ret['Billing']['Debt']['relation'] = $this->debts;
+            }
 
             $ret['Billing']['Invoice']['class'] = 'Invoice';
-            $ret['Billing']['Invoice']['relation'] = $p1;
+            $ret['Billing']['Invoice']['relation'] = $invoicesPanel1;
             $ret['Billing']['Invoice']['options']['hide_delete_button'] = 1;
             $ret['Billing']['Invoice']['options']['hide_create_button'] = 1;
 
-            if ($p1->count() == 15) {
-                $p2 = $this->invoices()->orderBy('id', 'desc')->where('id', '<', $p1->last()->id)->get();
+            // 2nd panel with old invoices - collapsed and in 2 columns
+            if ($this->invoices->count() > 15) {
+                $invoicesPanel2 = collect();
 
-                if (! $p2->isEmpty()) {
-                    $ret['Billing']['OldInvoices']['view']['view'] = 'billingbase::Contract.oldInvoices';
-                    $ret['Billing']['OldInvoices']['view']['vars']['invoices'] = $p2;
-                    $ret['Billing']['OldInvoices']['panelOptions']['display'] = 'none';
+                for ($i = 15; $i < $this->invoices->count(); $i++) {
+                    $invoicesPanel2->push($this->invoices[$i]);
                 }
+
+                $ret['Billing']['OldInvoices']['view']['view'] = 'billingbase::Contract.oldInvoices';
+                $ret['Billing']['OldInvoices']['view']['vars']['invoices'] = $invoicesPanel2;
+                $ret['Billing']['OldInvoices']['panelOptions']['display'] = 'none';
             }
         }
 
@@ -164,12 +184,13 @@ class Contract extends \BaseModel
             $ret['envia TEL']['Modem']['relation'] = $this->modems;
         }
 
-        if (\Module::collections()->has('Ccc')) {
+        if (\Module::collections()->has('Ccc') && \Module::collections()->has('BillingBase')) {
             $ret['Create Connection Infos']['Connection Information']['view']['view'] = 'ccc::prov.conn_info';
         }
 
         if (\Module::collections()->has('Ticketsystem')) {
-            $ret['Edit']['Ticket'] = $this->tickets;
+            $ret['Edit']['Ticket']['class'] = 'Ticket';
+            $ret['Edit']['Ticket']['relation'] = $this->tickets;
         }
 
         if (\Module::collections()->has('Mail')) {
@@ -182,6 +203,11 @@ class Contract extends \BaseModel
     /*
      * Relations
      */
+    public function debts()
+    {
+        return $this->hasMany('Modules\Dunning\Entities\Debt')->orderBy('date', 'desc');
+    }
+
     public function modems()
     {
         return $this->hasMany('Modules\ProvBase\Entities\Modem');
@@ -466,7 +492,7 @@ class Contract extends \BaseModel
             $items = $this->items()
                 ->leftJoin('product', 'product.id', '=', 'item.product_id')
                 ->whereIn('product.type', ['Internet', 'Voip'])
-                ->where(whereLaterOrEqualThanDate('item.valid_to', date('Y-m-d', strtotime("-$item_max_ended_before days"))))
+                ->where(whereLaterOrEqual('item.valid_to', date('Y-m-d', strtotime("-$item_max_ended_before days"))))
                 // ->orderBy('valid_from', 'desc')
                 ->select('item.*')
                 ->with('product')
@@ -1212,6 +1238,29 @@ class Contract extends \BaseModel
         $ret['tariff'] = $tariff;
 
         return $ret;
+    }
+
+    /**
+     * Return the outstanding amount
+     *
+     * @return float
+     */
+    public function getResultingDebt()
+    {
+        if (! \Module::collections()->has('Dunning')) {
+            return;
+        }
+
+        $sum = \Modules\Dunning\Entities\Debt::where('contract_id', $this->id)
+            ->groupBy('contract_id')
+            ->selectRaw('(SUM(amount) + SUM(total_fee)) as sum')
+            ->first();
+
+        if (! $sum) {
+            return 0;
+        }
+
+        return $sum->sum;
     }
 }
 

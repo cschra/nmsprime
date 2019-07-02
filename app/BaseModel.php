@@ -213,7 +213,7 @@ class BaseModel extends Eloquent
             // the calling method's name and use that as the relationship name as most
             // of the time this will be what we desire to use for the relationships.
             if (is_null($relation)) {
-                list($current, $caller) = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2);
+                [$current, $caller] = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2);
 
                 $relation = $caller['function'];
             }
@@ -245,12 +245,11 @@ class BaseModel extends Eloquent
     }
 
     /**
-     * Basefunction for returning all objects that a model can have a relation to
-     * Place this function in the model where the edit/create view shall show all related objects
+     * Basefunction to define tabs with associated panels (relation or view) for the models edit page
+     * E.g. Add relation panel 'modems' on the right side of the contract edit page - see ContractController::view_has_many()
+     * Note: Use Controller::editTabs() to define tabs refering to new pages
      *
-     * @author Nino Ryschawy
-     *
-     * @return an array with the appropriate hasMany()-functions of the model
+     * @return array
      */
     public function view_has_many()
     {
